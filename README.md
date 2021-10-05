@@ -15,7 +15,7 @@ Install
 
 import (
   ...
-  "github.com/soyvural/connection-pool"
+  "github.com/soyvural/connpool"
 )
 
 func main() {
