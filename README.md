@@ -19,13 +19,13 @@ import (
 )
 
 func main() {
-  cfg := connectionpool.Config{
+  cfg := connpool.Config{
     MinSize:     5,
     MaxSize:     20,
     Increment:   2,
     IdleTimeout: 30 * time.Minute,
   }
-  p, err := connectionpool.New(cfg, connectionpool.WithName("my-pool"))
+  p, err := connpool.New(cfg, connpool.WithName("my-pool"))
   if err != nil {
     // handle error
   }
