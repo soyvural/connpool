@@ -23,3 +23,6 @@ jobs:
 
       - name: Test
         run: go test -v ./...
+
+      - name: Test for 30 times
+        run: go test -count=30 ./...
