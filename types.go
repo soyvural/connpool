@@ -39,6 +39,4 @@ type Stats interface {
 
 	// Success total number of successfully completed get connection.
 	Success() int
-
-	reset()
 }

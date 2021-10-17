@@ -122,7 +122,9 @@ func (p *pool) Name() string {
 // Stats returns statistical info of pool.
 // It might be extended in the future.
 func (p *pool) Stats() Stats {
-	return p.stats
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.stats.snapshot()
 }
 
 func (p *pool) start() error {

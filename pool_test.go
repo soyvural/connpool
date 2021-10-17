@@ -376,17 +376,19 @@ func TestConcurrency(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					for i := 0; i < tc.reqCount; i++ {
-						active, available := p.Stats().Active(), p.Stats().Available()
+						stats := p.Stats()
+						active, available := stats.Active(), stats.Available()
 						if active+available > cfg.MaxSize {
 							t.Fatalf("conn management error, active: %d, available: %d, maxConn: %d", active, available, cfg.MaxSize)
 						}
 
 						c, _ := p.Get()
-						if c != nil {
-							atomic.AddInt64(&successCount, 1)
-							time.Sleep(20 * time.Millisecond)
-							_ = c.Close()
+						if c == nil {
+							continue
 						}
+						atomic.AddInt64(&successCount, 1)
+						time.Sleep(20 * time.Millisecond)
+						_ = c.Close()
 					}
 				}()
 			}
