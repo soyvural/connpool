@@ -12,12 +12,12 @@ import (
 
 const (
 	defaultNamePrefix = "conn-pool"
-	// maxPingRetries is the number of times Get() will try to find a healthy
+	// maxHealthRetries is the number of times Get() will try to find a healthy
 	// connection before giving up and creating a new one.
-	maxPingRetries = 3
+	maxHealthRetries = 3
 )
 
-var connPoolCounter = newCounter()
+var connPoolCounter atomic.Int64
 
 // Option configures a pool.
 type Option func(p *pool) error
@@ -35,8 +35,8 @@ type pool struct {
 	cfg     Config
 	factory Factory
 	conns   chan *conn
-	running int32
-	mu      sync.RWMutex
+	running atomic.Bool
+	mu      sync.Mutex
 	stats   *stats
 	stopCh  chan struct{}
 }
@@ -65,7 +65,7 @@ func New(cfg Config, factory Factory, options ...Option) (Pool, error) {
 		}
 	}
 	if p.name == "" {
-		p.name = fmt.Sprintf("%s-%d", defaultNamePrefix, connPoolCounter.inc())
+		p.name = fmt.Sprintf("%s-%d", defaultNamePrefix, connPoolCounter.Add(1))
 	}
 	if err := p.start(); err != nil {
 		return nil, err
@@ -75,10 +75,10 @@ func New(cfg Config, factory Factory, options ...Option) (Pool, error) {
 
 // Get returns a healthy connection from the pool. It blocks until a connection
 // is available, the context is cancelled, or the pool is closed.
-func (p *pool) Get(ctx context.Context) (conn net.Conn, err error) {
+func (p *pool) Get(ctx context.Context) (c net.Conn, err error) {
 	defer p.updateStat(&err)
 
-	if p.conns == nil || atomic.LoadInt32(&p.running) == 0 {
+	if !p.running.Load() {
 		return nil, ErrClosed
 	}
 	return p.get(ctx)
@@ -87,15 +87,15 @@ func (p *pool) Get(ctx context.Context) (conn net.Conn, err error) {
 // MarkUnusable marks a connection so it will be destroyed on Close() instead
 // of being returned to the pool.
 func (p *pool) MarkUnusable(c net.Conn) {
-	if c, ok := c.(*conn); ok {
-		c.markUnusable()
+	if pc, ok := c.(*conn); ok {
+		pc.markUnusable()
 	}
 }
 
 // Stop shuts down the pool. All idle connections are closed. Active connections
 // will be closed when they are returned (via Close()).
 func (p *pool) Stop() error {
-	if !atomic.CompareAndSwapInt32(&p.running, 1, 0) {
+	if !p.running.CompareAndSwap(true, false) {
 		return nil
 	}
 
@@ -131,17 +131,15 @@ func (p *pool) Name() string {
 
 // Stats returns a snapshot of pool statistics.
 func (p *pool) Stats() Stats {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
 	return p.stats.snapshot()
 }
 
 func (p *pool) start() error {
-	if !atomic.CompareAndSwapInt32(&p.running, 0, 1) {
+	if !p.running.CompareAndSwap(false, true) {
 		return nil
 	}
 	if err := p.addConnections(p.cfg.MinSize); err != nil {
-		atomic.StoreInt32(&p.running, 0)
+		p.running.Store(false)
 		return fmt.Errorf("failed to create initial connections: %w", err)
 	}
 	if interval := p.cfg.evictInterval(); interval > 0 {
@@ -150,54 +148,69 @@ func (p *pool) start() error {
 	return nil
 }
 
+// get tries to return a healthy connection, iteratively (no recursion).
 func (p *pool) get(ctx context.Context) (net.Conn, error) {
-	// Fast path: try non-blocking channel read.
-	for range maxPingRetries {
+	// Fast path: try non-blocking channel reads.
+	for range maxHealthRetries {
 		select {
 		case c := <-p.conns:
-			if healthy, reason := p.checkHealth(c); !healthy {
-				p.closeConn(c, reason)
-				continue
+			if p.returnIfHealthy(c) {
+				return c, nil
 			}
-			return c, nil
+			continue
 		default:
-			// No idle connection available, try to grow.
-			return p.tryGetOrWait(ctx)
+			// No idle connection available — fall through to grow/wait.
 		}
+		break
 	}
-	// All retries exhausted from stale connections, grow or wait.
-	return p.tryGetOrWait(ctx)
+	return p.growOrWait(ctx)
 }
 
-// tryGetOrWait tries to create new connections if under capacity,
+// returnIfHealthy checks health and closes unhealthy connections. Returns true if healthy.
+func (p *pool) returnIfHealthy(c *conn) bool {
+	if healthy, _ := p.checkHealth(c); healthy {
+		return true
+	}
+	p.destroyConn(c)
+	return false
+}
+
+// growOrWait tries to create new connections if under capacity,
 // otherwise blocks until one becomes available or ctx is done.
-func (p *pool) tryGetOrWait(ctx context.Context) (net.Conn, error) {
-	if p.stats.size.val() < p.cfg.MaxSize {
+func (p *pool) growOrWait(ctx context.Context) (net.Conn, error) {
+	// Try to grow the pool.
+	currentSize := int(p.stats.size.Load())
+	if currentSize < p.cfg.MaxSize {
 		n := p.cfg.Increment
-		if n+p.stats.size.val() > p.cfg.MaxSize {
-			n = p.cfg.MaxSize - p.stats.size.val()
+		if n+currentSize > p.cfg.MaxSize {
+			n = p.cfg.MaxSize - currentSize
 		}
 		if err := p.addConnections(n); err != nil {
 			return nil, err
 		}
-		// Try again after growing.
+		// Try to grab one of the newly created connections.
 		select {
 		case c := <-p.conns:
-			if healthy, reason := p.checkHealth(c); !healthy {
-				p.closeConn(c, reason)
-				return p.tryGetOrWait(ctx)
+			if p.returnIfHealthy(c) {
+				return c, nil
 			}
-			return c, nil
+			// Unhealthy new connection — unusual, but don't recurse.
+			return nil, ErrExhausted
 		default:
+			// Another goroutine took it.
 			return nil, ErrExhausted
 		}
 	}
 
 	// Pool is at max capacity — wait for a connection to be returned.
-	p.stats.waitCount.inc()
+	return p.waitForConn(ctx)
+}
+
+func (p *pool) waitForConn(ctx context.Context) (net.Conn, error) {
+	p.stats.waitCount.Add(1)
 	start := time.Now()
 	defer func() {
-		p.stats.waitTimeNanos.add(int64(time.Since(start)))
+		p.stats.waitTimeNanos.Add(int64(time.Since(start)))
 	}()
 
 	select {
@@ -205,20 +218,19 @@ func (p *pool) tryGetOrWait(ctx context.Context) (net.Conn, error) {
 		if c == nil {
 			return nil, ErrClosed
 		}
-		if healthy, reason := p.checkHealth(c); !healthy {
-			p.closeConn(c, reason)
-			// Closing freed a slot, try creating a fresh one.
-			if err := p.addConnections(1); err != nil {
-				return nil, err
-			}
-			select {
-			case fresh := <-p.conns:
-				return fresh, nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+		if p.returnIfHealthy(c) {
+			return c, nil
 		}
-		return c, nil
+		// Connection was unhealthy. Create a replacement.
+		if err := p.addConnections(1); err != nil {
+			return nil, err
+		}
+		select {
+		case fresh := <-p.conns:
+			return fresh, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -233,16 +245,16 @@ func (p *pool) checkHealth(c *conn) (bool, string) {
 		return false, "unusable"
 	}
 	if c.isExpired() {
-		p.stats.lifetimeClosed.inc()
+		p.stats.lifetimeClosed.Add(1)
 		return false, "lifetime"
 	}
 	if c.isIdle(p.cfg.IdleTimeout) {
-		p.stats.idleClosed.inc()
+		p.stats.idleClosed.Add(1)
 		return false, "idle"
 	}
 	if p.cfg.Ping != nil {
 		if err := p.cfg.Ping(c.Conn); err != nil {
-			p.stats.pingFailed.inc()
+			p.stats.pingFailed.Add(1)
 			return false, "ping"
 		}
 	}
@@ -250,8 +262,8 @@ func (p *pool) checkHealth(c *conn) (bool, string) {
 }
 
 func (p *pool) put(c *conn) error {
-	if c.isUnusable() || atomic.LoadInt32(&p.running) == 0 {
-		p.stats.size.dec()
+	if c.isUnusable() || !p.running.Load() {
+		p.stats.size.Add(-1)
 		return c.Conn.Close()
 	}
 	c.stampLastUsed()
@@ -260,17 +272,17 @@ func (p *pool) put(c *conn) error {
 		return nil
 	default:
 		// Channel full — close the connection.
-		p.stats.size.dec()
+		p.stats.size.Add(-1)
 		return c.Conn.Close()
 	}
 }
 
-func (p *pool) addConnections(size int) error {
+func (p *pool) addConnections(n int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for range size {
-		if p.stats.size.val() >= p.cfg.MaxSize {
+	for range n {
+		if int(p.stats.size.Load()) >= p.cfg.MaxSize {
 			return nil
 		}
 		netConn, err := p.factory()
@@ -278,15 +290,21 @@ func (p *pool) addConnections(size int) error {
 			return fmt.Errorf("factory error: %w", err)
 		}
 		c := newConn(netConn, p, p.cfg.maxLifetimeWithJitter())
-		c.stampLastUsed()
-		p.conns <- c
-		p.stats.size.inc()
+		p.stats.size.Add(1)
+		// Non-blocking send: if channel is somehow full, destroy.
+		select {
+		case p.conns <- c:
+		default:
+			p.stats.size.Add(-1)
+			_ = netConn.Close()
+		}
 	}
 	return nil
 }
 
-func (p *pool) closeConn(c *conn, _ string) {
-	p.stats.size.dec()
+// destroyConn closes a connection and decrements the size counter.
+func (p *pool) destroyConn(c *conn) {
+	p.stats.size.Add(-1)
 	if c.Conn != nil {
 		_ = c.Conn.Close()
 	}
@@ -297,9 +315,9 @@ func (p *pool) available() int {
 }
 
 func (p *pool) updateStat(err *error) {
-	p.stats.request.inc()
+	p.stats.request.Add(1)
 	if *err == nil {
-		p.stats.success.inc()
+		p.stats.success.Add(1)
 	}
 }
 
@@ -319,7 +337,7 @@ func (p *pool) evictLoop(interval time.Duration) {
 }
 
 func (p *pool) evict() {
-	if atomic.LoadInt32(&p.running) == 0 {
+	if !p.running.Load() {
 		return
 	}
 
@@ -328,15 +346,14 @@ func (p *pool) evict() {
 	for range n {
 		select {
 		case c := <-p.conns:
-			if healthy, reason := p.checkHealth(c); !healthy {
-				p.closeConn(c, reason)
+			if healthy, _ := p.checkHealth(c); !healthy {
+				p.destroyConn(c)
 				continue
 			}
-			// Still healthy, put back.
 			select {
 			case p.conns <- c:
 			default:
-				p.closeConn(c, "overflow")
+				p.destroyConn(c)
 			}
 		default:
 			return
@@ -344,7 +361,7 @@ func (p *pool) evict() {
 	}
 
 	// Maintain min idle count.
-	current := p.stats.size.val()
+	current := int(p.stats.size.Load())
 	if current < p.cfg.MinSize {
 		_ = p.addConnections(p.cfg.MinSize - current)
 	}

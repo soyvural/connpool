@@ -8,25 +8,25 @@ import (
 	"time"
 )
 
+type testBenchServer struct {
+	listener net.Listener
+}
+
 func benchServer(b *testing.B) (*testBenchServer, Factory) {
 	b.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatalf("listen: %v", err)
 	}
-	s := &testBenchServer{listener: l, done: make(chan struct{})}
+	s := &testBenchServer{listener: l}
 	go s.accept()
+	b.Cleanup(s.stop)
 
 	addr := l.Addr().String()
 	factory := func() (net.Conn, error) {
 		return net.Dial("tcp", addr)
 	}
 	return s, factory
-}
-
-type testBenchServer struct {
-	listener net.Listener
-	done     chan struct{}
 }
 
 func (s *testBenchServer) accept() {
@@ -46,16 +46,11 @@ func (s *testBenchServer) accept() {
 	}
 }
 
-func (s *testBenchServer) stop() {
-	close(s.done)
-	s.listener.Close()
-}
+func (s *testBenchServer) stop() { _ = s.listener.Close() }
 
-// BenchmarkGetPut measures the throughput of Get+Close (return to pool) with
-// no contention (sequential, single goroutine).
+// BenchmarkGetPut_Sequential measures Get+Close throughput with no contention.
 func BenchmarkGetPut_Sequential(b *testing.B) {
-	srv, factory := benchServer(b)
-	defer srv.stop()
+	_, factory := benchServer(b)
 
 	cfg := Config{
 		MinSize:       5,
@@ -68,7 +63,7 @@ func BenchmarkGetPut_Sequential(b *testing.B) {
 	if err != nil {
 		b.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	b.ResetTimer()
@@ -78,14 +73,13 @@ func BenchmarkGetPut_Sequential(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Get: %v", err)
 		}
-		c.Close()
+		_ = c.Close()
 	}
 }
 
 // BenchmarkGetPut_Parallel measures throughput under concurrent load.
 func BenchmarkGetPut_Parallel(b *testing.B) {
-	srv, factory := benchServer(b)
-	defer srv.stop()
+	_, factory := benchServer(b)
 
 	cfg := Config{
 		MinSize:       5,
@@ -98,7 +92,7 @@ func BenchmarkGetPut_Parallel(b *testing.B) {
 	if err != nil {
 		b.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	b.ResetTimer()
@@ -109,15 +103,14 @@ func BenchmarkGetPut_Parallel(b *testing.B) {
 			if err != nil {
 				continue
 			}
-			c.Close()
+			_ = c.Close()
 		}
 	})
 }
 
 // BenchmarkGetPut_WithPing measures overhead of the health check on each Get.
 func BenchmarkGetPut_WithPing(b *testing.B) {
-	srv, factory := benchServer(b)
-	defer srv.stop()
+	_, factory := benchServer(b)
 
 	cfg := Config{
 		MinSize:       5,
@@ -126,11 +119,10 @@ func BenchmarkGetPut_WithPing(b *testing.B) {
 		IdleTimeout:   time.Minute,
 		EvictInterval: -1,
 		Ping: func(c net.Conn) error {
-			// Lightweight ping: set a short read deadline to check if conn is alive.
-			c.SetReadDeadline(time.Now().Add(time.Microsecond))
+			_ = c.SetReadDeadline(time.Now().Add(time.Microsecond))
 			buf := make([]byte, 1)
-			c.Read(buf)
-			c.SetReadDeadline(time.Time{})
+			_, _ = c.Read(buf)
+			_ = c.SetReadDeadline(time.Time{})
 			return nil
 		},
 	}
@@ -138,7 +130,7 @@ func BenchmarkGetPut_WithPing(b *testing.B) {
 	if err != nil {
 		b.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	b.ResetTimer()
@@ -148,15 +140,13 @@ func BenchmarkGetPut_WithPing(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Get: %v", err)
 		}
-		c.Close()
+		_ = c.Close()
 	}
 }
 
-// BenchmarkGetPut_Contended measures behavior when pool is fully utilized
-// and goroutines must wait for connections to be returned.
+// BenchmarkGetPut_Contended measures behavior under full pool contention.
 func BenchmarkGetPut_Contended(b *testing.B) {
-	srv, factory := benchServer(b)
-	defer srv.stop()
+	_, factory := benchServer(b)
 
 	cfg := Config{
 		MinSize:       2,
@@ -169,7 +159,7 @@ func BenchmarkGetPut_Contended(b *testing.B) {
 	if err != nil {
 		b.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	b.ResetTimer()
@@ -190,7 +180,7 @@ func BenchmarkGetPut_Contended(b *testing.B) {
 				if err != nil {
 					continue
 				}
-				c.Close()
+				_ = c.Close()
 			}
 		}()
 	}

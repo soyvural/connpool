@@ -5,94 +5,48 @@ import (
 	"time"
 )
 
-type counter interface {
-	inc() int
-	dec() int
-	add(n int64) int
-	reset() int
-	val() int
-}
-
 type availabler interface {
 	available() int
 }
 
-type count struct {
-	v int64
-}
-
-func newCounter() counter {
-	return &count{}
-}
-
-func (c *count) inc() int {
-	return int(atomic.AddInt64(&c.v, 1))
-}
-
-func (c *count) dec() int {
-	return int(atomic.AddInt64(&c.v, -1))
-}
-
-func (c *count) add(n int64) int {
-	return int(atomic.AddInt64(&c.v, n))
-}
-
-func (c *count) val() int {
-	return int(atomic.LoadInt64(&c.v))
-}
-
-func (c *count) reset() int {
-	return int(atomic.SwapInt64(&c.v, 0))
-}
-
 type stats struct {
 	a              availabler
-	size           counter
-	request        counter
-	success        counter
-	idleClosed     counter
-	lifetimeClosed counter
-	pingFailed     counter
-	waitCount      counter
-	waitTimeNanos  counter // cumulative nanoseconds
+	size           atomic.Int64
+	request        atomic.Int64
+	success        atomic.Int64
+	idleClosed     atomic.Int64
+	lifetimeClosed atomic.Int64
+	pingFailed     atomic.Int64
+	waitCount      atomic.Int64
+	waitTimeNanos  atomic.Int64
 }
 
 func newStats(a availabler) *stats {
-	return &stats{
-		a:              a,
-		size:           newCounter(),
-		request:        newCounter(),
-		success:        newCounter(),
-		idleClosed:     newCounter(),
-		lifetimeClosed: newCounter(),
-		pingFailed:     newCounter(),
-		waitCount:      newCounter(),
-		waitTimeNanos:  newCounter(),
-	}
+	return &stats{a: a}
 }
 
 func (s *stats) reset() {
-	s.size.reset()
-	s.success.reset()
-	s.request.reset()
-	s.idleClosed.reset()
-	s.lifetimeClosed.reset()
-	s.pingFailed.reset()
-	s.waitCount.reset()
-	s.waitTimeNanos.reset()
+	s.size.Store(0)
+	s.success.Store(0)
+	s.request.Store(0)
+	s.idleClosed.Store(0)
+	s.lifetimeClosed.Store(0)
+	s.pingFailed.Store(0)
+	s.waitCount.Store(0)
+	s.waitTimeNanos.Store(0)
 }
 
 func (s *stats) snapshot() Stats {
 	return &statsSnapshot{
 		available:      s.a.available(),
-		size:           s.size.val(),
-		request:        s.request.val(),
-		success:        s.success.val(),
-		idleClosed:     s.idleClosed.val(),
-		lifetimeClosed: s.lifetimeClosed.val(),
-		pingFailed:     s.pingFailed.val(),
-		waitCount:      s.waitCount.val(),
-		waitTime:       time.Duration(s.waitTimeNanos.val()),
+		size:           int(s.size.Load()),
+		request:        int(s.request.Load()),
+		success:        int(s.success.Load()),
+		idleClosed:     int(s.idleClosed.Load()),
+		lifetimeClosed: int(s.lifetimeClosed.Load()),
+		pingFailed:     int(s.pingFailed.Load()),
+		waitCount:      int(s.waitCount.Load()),
+		waitTime:       time.Duration(s.waitTimeNanos.Load()),
 	}
 }
 

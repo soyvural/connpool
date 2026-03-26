@@ -14,9 +14,7 @@ import (
 // --- test helpers ---
 
 type testServer struct {
-	listener  net.Listener
-	terminate chan struct{}
-	conns     int64
+	listener net.Listener
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -25,8 +23,9 @@ func newTestServer(t *testing.T) *testServer {
 	if err != nil {
 		t.Fatalf("failed to start test server: %v", err)
 	}
-	s := &testServer{listener: l, terminate: make(chan struct{})}
+	s := &testServer{listener: l}
 	go s.accept()
+	t.Cleanup(s.stop)
 	return s
 }
 
@@ -36,20 +35,15 @@ func (s *testServer) accept() {
 		if err != nil {
 			return
 		}
-		atomic.AddInt64(&s.conns, 1)
 		go func() {
-			// Read and discard until closed.
-			io.Copy(io.Discard, c)
+			_, _ = io.Copy(io.Discard, c)
 		}()
 	}
 }
 
 func (s *testServer) addr() string { return s.listener.Addr().String() }
 
-func (s *testServer) stop() {
-	close(s.terminate)
-	s.listener.Close()
-}
+func (s *testServer) stop() { _ = s.listener.Close() }
 
 func testFactory(t *testing.T, srv *testServer) Factory {
 	t.Helper()
@@ -133,35 +127,32 @@ func TestNew_NilFactory(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
 		MaxSize:       5,
 		Increment:     1,
 		IdleTimeout:   time.Minute,
-		EvictInterval: -1, // disable evictor for deterministic test
+		EvictInterval: -1,
 	}
 	p, err := New(cfg, testFactory(t, srv))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
-	ctx := context.Background()
-	c, err := p.Get(ctx)
+	c, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if c == nil {
 		t.Fatal("Get returned nil conn")
 	}
-	c.Close()
+	_ = c.Close()
 }
 
 func TestGet_ContextCancelled(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
@@ -174,25 +165,24 @@ func TestGet_ContextCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
-	ctx := context.Background()
 	// Take the only connection.
-	c, err := p.Get(ctx)
+	c, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 
-	// Now pool is exhausted. A cancelled context should return immediately.
-	cancelCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	// Pool is exhausted. A cancelled context should return quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, err = p.Get(cancelCtx)
+	_, err = p.Get(ctx)
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
 	}
 
-	c.Close()
+	_ = c.Close()
 }
 
 func TestGet_ClosedPool(t *testing.T) {
@@ -200,7 +190,7 @@ func TestGet_ClosedPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	p.Stop()
+	_ = p.Stop()
 
 	_, err = p.Get(context.Background())
 	if err != ErrClosed {
@@ -210,7 +200,6 @@ func TestGet_ClosedPool(t *testing.T) {
 
 func TestGet_GrowsOnDemand(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       0,
@@ -223,7 +212,7 @@ func TestGet_GrowsOnDemand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	var conns []net.Conn
@@ -240,7 +229,7 @@ func TestGet_GrowsOnDemand(t *testing.T) {
 	}
 
 	for _, c := range conns {
-		c.Close()
+		_ = c.Close()
 	}
 }
 
@@ -248,10 +237,8 @@ func TestGet_GrowsOnDemand(t *testing.T) {
 
 func TestGet_PingEvictsUnhealthyConn(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	var pingCount atomic.Int32
-	failFirst := true
 
 	cfg := Config{
 		MinSize:       2,
@@ -260,8 +247,7 @@ func TestGet_PingEvictsUnhealthyConn(t *testing.T) {
 		IdleTimeout:   time.Minute,
 		EvictInterval: -1,
 		Ping: func(c net.Conn) error {
-			n := pingCount.Add(1)
-			if failFirst && n == 1 {
+			if pingCount.Add(1) == 1 {
 				return fmt.Errorf("simulated ping failure")
 			}
 			return nil
@@ -271,27 +257,23 @@ func TestGet_PingEvictsUnhealthyConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
-	ctx := context.Background()
-	c, err := p.Get(ctx)
+	c, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	c.Close()
+	_ = c.Close()
 
-	stats := p.Stats()
-	if stats.PingFailed() != 1 {
-		t.Fatalf("PingFailed: got %d, want 1", stats.PingFailed())
+	if got := p.Stats().PingFailed(); got != 1 {
+		t.Fatalf("PingFailed: got %d, want 1", got)
 	}
-	_ = failFirst // keep variable used
 }
 
 // --- Idle Timeout ---
 
 func TestGet_IdleTimeoutEvictsStaleConn(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
@@ -304,27 +286,26 @@ func TestGet_IdleTimeoutEvictsStaleConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	c, err := p.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	c.Close()
+	_ = c.Close()
 
 	// Wait for the connection to become idle.
 	time.Sleep(100 * time.Millisecond)
 
-	// Next Get should evict the stale connection and create a new one.
 	c2, err := p.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get after idle: %v", err)
 	}
-	c2.Close()
+	_ = c2.Close()
 
-	if p.Stats().IdleClosed() < 1 {
-		t.Fatalf("IdleClosed: got %d, want >= 1", p.Stats().IdleClosed())
+	if got := p.Stats().IdleClosed(); got < 1 {
+		t.Fatalf("IdleClosed: got %d, want >= 1", got)
 	}
 }
 
@@ -332,7 +313,6 @@ func TestGet_IdleTimeoutEvictsStaleConn(t *testing.T) {
 
 func TestGet_MaxLifetimeEvictsOldConn(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
@@ -346,14 +326,14 @@ func TestGet_MaxLifetimeEvictsOldConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	ctx := context.Background()
 	c, err := p.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	c.Close()
+	_ = c.Close()
 
 	// Wait for the connection to exceed max lifetime.
 	time.Sleep(100 * time.Millisecond)
@@ -362,10 +342,10 @@ func TestGet_MaxLifetimeEvictsOldConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get after lifetime: %v", err)
 	}
-	c2.Close()
+	_ = c2.Close()
 
-	if p.Stats().LifetimeClosed() < 1 {
-		t.Fatalf("LifetimeClosed: got %d, want >= 1", p.Stats().LifetimeClosed())
+	if got := p.Stats().LifetimeClosed(); got < 1 {
+		t.Fatalf("LifetimeClosed: got %d, want >= 1", got)
 	}
 }
 
@@ -373,7 +353,6 @@ func TestGet_MaxLifetimeEvictsOldConn(t *testing.T) {
 
 func TestEvictor_CleansStaleConnections(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       2,
@@ -386,25 +365,18 @@ func TestEvictor_CleansStaleConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	// Wait for connections to become idle and evictor to run.
 	time.Sleep(200 * time.Millisecond)
 
-	stats := p.Stats()
-	if stats.IdleClosed() < 1 {
-		t.Fatalf("IdleClosed: got %d, want >= 1", stats.IdleClosed())
-	}
-
-	// Evictor should maintain min size.
-	if stats.Available() < cfg.MinSize {
-		t.Logf("Available=%d (min=%d) — evictor may still be replenishing", stats.Available(), cfg.MinSize)
+	if got := p.Stats().IdleClosed(); got < 1 {
+		t.Fatalf("IdleClosed: got %d, want >= 1", got)
 	}
 }
 
 func TestEvictor_StopsOnPoolStop(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
@@ -421,7 +393,7 @@ func TestEvictor_StopsOnPoolStop(t *testing.T) {
 	// Stopping should not hang (evictor goroutine exits cleanly).
 	done := make(chan struct{})
 	go func() {
-		p.Stop()
+		_ = p.Stop()
 		close(done)
 	}()
 
@@ -436,7 +408,6 @@ func TestEvictor_StopsOnPoolStop(t *testing.T) {
 
 func TestMarkUnusable(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
@@ -449,19 +420,17 @@ func TestMarkUnusable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
-	ctx := context.Background()
-	c, err := p.Get(ctx)
+	c, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 
 	sizeBefore := p.Stats().Size()
 	p.MarkUnusable(c)
-	c.Close() // should destroy, not return to pool
+	_ = c.Close()
 
-	// Size should decrease since the connection was destroyed.
 	sizeAfter := p.Stats().Size()
 	if sizeAfter >= sizeBefore {
 		t.Fatalf("Size after MarkUnusable+Close: got %d, want < %d", sizeAfter, sizeBefore)
@@ -484,7 +453,6 @@ func TestConcurrency(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.desc, func(t *testing.T) {
 			srv := newTestServer(t)
-			defer srv.stop()
 
 			cfg := Config{
 				MinSize:       1,
@@ -497,10 +465,10 @@ func TestConcurrency(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			defer p.Stop()
+			defer func() { _ = p.Stop() }()
 
 			ctx := context.Background()
-			var successCount int64
+			var successCount atomic.Int64
 			var wg sync.WaitGroup
 			wg.Add(tc.workers)
 
@@ -512,9 +480,9 @@ func TestConcurrency(t *testing.T) {
 						if err != nil {
 							continue
 						}
-						atomic.AddInt64(&successCount, 1)
+						successCount.Add(1)
 						time.Sleep(time.Millisecond)
-						c.Close()
+						_ = c.Close()
 					}
 				}()
 			}
@@ -525,8 +493,8 @@ func TestConcurrency(t *testing.T) {
 			if stats.Request() != wantReq {
 				t.Fatalf("Request: got %d, want %d", stats.Request(), wantReq)
 			}
-			if stats.Success() != int(successCount) {
-				t.Fatalf("Success: got %d, want %d", stats.Success(), successCount)
+			if stats.Success() != int(successCount.Load()) {
+				t.Fatalf("Success: got %d, want %d", stats.Success(), successCount.Load())
 			}
 			if stats.Active() > cfg.MaxSize {
 				t.Fatalf("Active=%d exceeds MaxSize=%d", stats.Active(), cfg.MaxSize)
@@ -559,7 +527,6 @@ func TestName(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       3,
@@ -572,7 +539,7 @@ func TestStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	stats := p.Stats()
 	if stats.Available() != 3 {
@@ -582,8 +549,7 @@ func TestStats(t *testing.T) {
 		t.Fatalf("Size: got %d, want 3", stats.Size())
 	}
 
-	ctx := context.Background()
-	c, err := p.Get(ctx)
+	c, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -599,14 +565,13 @@ func TestStats(t *testing.T) {
 		t.Fatalf("Success: got %d, want 1", stats.Success())
 	}
 
-	c.Close()
+	_ = c.Close()
 }
 
 // --- Wait metrics ---
 
 func TestStats_WaitMetrics(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       1,
@@ -619,10 +584,9 @@ func TestStats_WaitMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
-	ctx := context.Background()
-	c, err := p.Get(ctx)
+	c, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -630,14 +594,14 @@ func TestStats_WaitMetrics(t *testing.T) {
 	// Return the connection after a delay so the waiter has to wait.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		c.Close()
+		_ = c.Close()
 	}()
 
-	c2, err := p.Get(ctx)
+	c2, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatalf("Get (wait): %v", err)
 	}
-	c2.Close()
+	_ = c2.Close()
 
 	stats := p.Stats()
 	if stats.WaitCount() < 1 {
@@ -652,7 +616,6 @@ func TestStats_WaitMetrics(t *testing.T) {
 
 func TestStop(t *testing.T) {
 	srv := newTestServer(t)
-	defer srv.stop()
 
 	cfg := Config{
 		MinSize:       3,

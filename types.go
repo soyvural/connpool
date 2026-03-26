@@ -11,7 +11,6 @@ import (
 var (
 	ErrClosed    = fmt.Errorf("pool is closed")
 	ErrExhausted = fmt.Errorf("pool is exhausted")
-	ErrTimeout   = fmt.Errorf("pool get timed out")
 )
 
 // Factory creates a new net.Conn. It is called when the pool needs to grow.
