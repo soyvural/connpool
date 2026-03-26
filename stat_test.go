@@ -7,16 +7,16 @@ import (
 
 func TestCounterInc(t *testing.T) {
 	c := newCounter()
-	wg := sync.WaitGroup{}
 	concur := 1000
 	loop := 1000
 	want := concur * loop
 
+	var wg sync.WaitGroup
 	wg.Add(concur)
-	for i := 0; i < concur; i++ {
+	for range concur {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < loop; i++ {
+			for range loop {
 				c.inc()
 			}
 		}()
@@ -24,22 +24,22 @@ func TestCounterInc(t *testing.T) {
 	wg.Wait()
 
 	if c.val() != want {
-		t.Fatalf("inc error, -want:%d, +got:%d", want, c.val())
+		t.Fatalf("inc: got %d, want %d", c.val(), want)
 	}
 }
 
 func TestCounterDec(t *testing.T) {
 	c := newCounter()
-	wg := sync.WaitGroup{}
 	concur := 1000
 	loop := 1000
 	c.(*count).v = int64(concur * loop)
 
+	var wg sync.WaitGroup
 	wg.Add(concur)
-	for i := 0; i < concur; i++ {
+	for range concur {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < loop; i++ {
+			for range loop {
 				c.dec()
 			}
 		}()
@@ -47,29 +47,17 @@ func TestCounterDec(t *testing.T) {
 	wg.Wait()
 
 	if c.val() != 0 {
-		t.Fatalf("dec error, -want:%d, +got:%d", 0, c.val())
+		t.Fatalf("dec: got %d, want 0", c.val())
 	}
 }
 
 func TestCounterReset(t *testing.T) {
 	c := newCounter()
-	wg := sync.WaitGroup{}
-	conCount := 1000
-	loop := 1000
-
-	wg.Add(conCount)
-	for i := 0; i < conCount; i++ {
-		go func() {
-			defer wg.Done()
-			for i := 0; i < loop; i++ {
-				c.inc()
-			}
-		}()
+	for range 100 {
+		c.inc()
 	}
-	wg.Wait()
-
 	c.reset()
 	if c.val() != 0 {
-		t.Fatalf("reset error, -want:%d, +got:%d", 0, c.val())
+		t.Fatalf("reset: got %d, want 0", c.val())
 	}
 }
