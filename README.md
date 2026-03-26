@@ -1,5 +1,10 @@
 # connpool
 
+[![CI](https://github.com/soyvural/connpool/actions/workflows/ci.yml/badge.svg)](https://github.com/soyvural/connpool/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/soyvural/connpool.svg)](https://pkg.go.dev/github.com/soyvural/connpool)
+[![Go Report Card](https://goreportcard.com/badge/github.com/soyvural/connpool)](https://goreportcard.com/report/github.com/soyvural/connpool)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 A production-grade TCP connection pool for Go. Designed for high-throughput, low-latency network workloads where connection reuse matters.
 
 ## Why This Pool?
@@ -152,6 +157,27 @@ BenchmarkGetPut_Sequential-10    8,556,068    139.9 ns/op    0 B/op    0 allocs/
 BenchmarkGetPut_Parallel-10      5,075,728    245.1 ns/op    0 B/op    0 allocs/op
 BenchmarkGetPut_WithPing-10        216,386   5571   ns/op   81 B/op    2 allocs/op
 BenchmarkGetPut_Contended-10     2,405,068    478.7 ns/op    0 B/op    0 allocs/op
+```
+
+## Examples
+
+Working examples are in the [`examples/`](examples/) directory:
+
+| Example | Description |
+|---------|-------------|
+| [tcp-echo](examples/tcp-echo) | Basic pool usage with a TCP echo server |
+| [redis-proxy](examples/redis-proxy) | Connection pooling with Ping health checks against Redis |
+| [load-balancer](examples/load-balancer) | Round-robin load balancing across multiple backends using independent pools |
+
+```shell
+# TCP echo (start: ncat -l -k -p 9090 --sh-exec "cat")
+go run ./examples/tcp-echo
+
+# Redis proxy (start: docker run -d -p 6379:6379 redis:alpine)
+go run ./examples/redis-proxy
+
+# Load balancer (start two ncat echo servers on ports 9001 and 9002)
+go run ./examples/load-balancer
 ```
 
 ## Design Decisions
